@@ -31,6 +31,9 @@ from NatNetClient import NatNetClient
 
 CameraSource = Union[int, str]
 
+# Recordings live in data/recordings/<MM-DD-YYYY>/, independent of the cwd.
+RECORDINGS_DIR = Path(__file__).resolve().parent.parent / "recordings"
+
 
 class Recorder:
     def __init__(self, args: argparse.Namespace) -> None:
@@ -248,7 +251,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, help="requested camera width")
     parser.add_argument("--height", type=int, help="requested camera height")
     parser.add_argument("--fps", type=float, help="requested/output frame rate")
-    parser.add_argument("--output-dir", type=Path, default=Path("recordings"))
+    parser.add_argument("--output-dir", type=Path,
+                        default=RECORDINGS_DIR / time.strftime("%m-%d-%Y"),
+                        help="output folder (default: %(default)s)")
     parser.add_argument("--name", default=time.strftime("capture_%Y%m%d_%H%M%S"))
     return parser.parse_args()
 

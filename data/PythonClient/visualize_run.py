@@ -15,6 +15,8 @@ except ImportError as exc:
         "Visualization requires: python -m pip install opencv-python numpy"
     ) from exc
 
+RECORDINGS_DIR = Path(__file__).resolve().parent.parent / "recordings"
+
 
 def load_samples(path: Path) -> dict[str, np.ndarray]:
     with path.open(newline="", encoding="utf-8") as handle:
@@ -172,24 +174,52 @@ def render(csv_path: Path, video_path: Path, output_path: Path) -> None:
     print(f"Saved {output_path} ({frame_number} frames)")
 
 
+def resolve_csvs(target: Path) -> list[Path]:
+    """Accept a CSV, a recording name, or a folder of recordings."""
+    for candidate in (target, RECORDINGS_DIR / target):
+        if candidate.is_dir():
+            return sorted(candidate.glob("*.csv"))
+        if candidate.suffix == ".csv" and candidate.is_file():
+            return [candidate]
+    matches = sorted(RECORDINGS_DIR.rglob(f"{target.stem}.csv"))
+    if not matches:
+        raise SystemExit(f"No recording named {target} under {RECORDINGS_DIR}")
+    if len(matches) > 1:
+        listed = "\n  ".join(str(match) for match in matches)
+        raise SystemExit(f"Recording name {target} is ambiguous:\n  {listed}")
+    return matches
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("csv", type=Path, help="CSV from record_mocap_camera.py")
+    parser.add_argument("target", type=Path,
+                        help="CSV from record_mocap_camera.py, a recording name "
+                             f"(searched under {RECORDINGS_DIR}), or a folder")
     parser.add_argument("video", type=Path, nargs="?",
                         help="camera MP4 (default: same stem as CSV)")
     parser.add_argument("--output", type=Path,
                         help="output MP4 (default: <stem>_visualization.mp4)")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="re-render outputs that already exist")
     args = parser.parse_args()
-    if args.video is None:
-        args.video = args.csv.with_suffix(".mp4")
-    if args.output is None:
-        args.output = args.csv.with_name(args.csv.stem + "_visualization.mp4")
+    args.csvs = resolve_csvs(args.target)
+    if len(args.csvs) > 1 and (args.video or args.output):
+        parser.error("video/--output can only be given for a single recording")
     return args
 
 
 def main() -> int:
     args = parse_args()
-    render(args.csv, args.video, args.output)
+    for csv_path in args.csvs:
+        video = args.video or csv_path.with_suffix(".mp4")
+        output = args.output or csv_path.with_name(csv_path.stem + "_visualization.mp4")
+        if output.exists() and not args.overwrite:
+            print(f"Skipping {csv_path.name}: {output} exists (use --overwrite)")
+            continue
+        if not video.exists():
+            print(f"Skipping {csv_path.name}: missing video {video}")
+            continue
+        render(csv_path, video, output)
     return 0
 
 
