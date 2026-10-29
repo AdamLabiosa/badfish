@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Jog a UFactory xArm 6 from the keyboard and print the end-effector pose.
+"""Jog a UFactory xArm 6 from the keyboard.
 
 Moves are discrete, blocking steps.  Holding a key repeats the step; queued
 key presses are discarded after each move so the arm never runs ahead of you.
-The TCP pose is printed every --interval seconds.  Ctrl+C stops the arm and
-exits.
+Press p to print the TCP pose, or pass --print-interval to print it
+periodically.  Ctrl+C stops the arm and exits.
 """
 
 from __future__ import annotations
@@ -203,8 +203,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_arm_args(parser)
-    parser.add_argument("--interval", type=float, default=1.0,
-                        help="seconds between pose printouts (default: %(default)s)")
+    parser.add_argument("--print-interval", type=float, metavar="SECONDS",
+                        help="print the TCP pose every SECONDS (default: off)")
     return parser.parse_args()
 
 
@@ -223,7 +223,7 @@ def main() -> int:
 
     def report_loop() -> None:
         # Runs on its own thread so the pose keeps printing during blocking moves.
-        while not stop_event.wait(args.interval):
+        while not stop_event.wait(args.print_interval):
             print_pose()
 
     reporter = threading.Thread(target=report_loop, name="pose-report", daemon=True)
@@ -231,7 +231,8 @@ def main() -> int:
         print(JOG_HELP)
         jogger.print_step()
         print_pose()
-        reporter.start()
+        if args.print_interval:
+            reporter.start()
         with Keyboard() as keyboard:
             while True:
                 key = keyboard.read_key(0.1)
