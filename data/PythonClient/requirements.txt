@@ -1,0 +1,3 @@
+xarm-python-sdk
+opencv-python
+numpy

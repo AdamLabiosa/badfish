@@ -17,7 +17,6 @@ import argparse
 import csv
 import math
 import sys
-import termios
 import threading
 import time
 from collections import deque
@@ -26,7 +25,7 @@ from typing import Deque, List, Optional, Tuple
 
 from NatNetClient import NatNetClient
 from xarm_keyboard_control import (
-    ArmJogger, JOG_HELP, JOG_KEYS, POSE_FORMAT, add_arm_args, cbreak_terminal, read_key,
+    ArmJogger, JOG_HELP, JOG_KEYS, POSE_FORMAT, Keyboard, add_arm_args,
 )
 
 
@@ -187,17 +186,17 @@ class Calibrator:
             print(HELP)
             self.jogger.print_step()
             self.print_pose()
-            with cbreak_terminal() as fd:
+            with Keyboard() as keyboard:
                 while True:
-                    key = read_key(fd, 0.1)
+                    key = keyboard.read_key(0.1)
                     if key is None:
                         continue
-                    if self.jogger.handle_key(key, fd):
+                    if self.jogger.handle_key(key, keyboard):
                         if key in JOG_KEYS:
                             self.print_pose()
                     elif key == " ":
                         self.record_sample()
-                        termios.tcflush(fd, termios.TCIFLUSH)
+                        keyboard.flush()
                     elif key == "x":
                         self.delete_sample()
                     elif key == "p":

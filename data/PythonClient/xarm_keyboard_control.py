@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import argparse
 import os
-import select
 import sys
-import termios
 import threading
 import time
-import tty
-from contextlib import contextmanager
-from typing import Iterator, List, Optional, Tuple
+from typing import List, Optional, Tuple
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import select
+    import termios
+    import tty
 
 try:
     from xarm.wrapper import XArmAPI
@@ -53,27 +56,55 @@ JOG_HELP = """
 POSE_FORMAT = "xyz=[{:8.1f} {:8.1f} {:8.1f}] mm  rpy=[{:7.1f} {:7.1f} {:7.1f}] deg"
 
 
-@contextmanager
-def cbreak_terminal() -> Iterator[int]:
-    """Deliver key presses immediately (no Enter) while keeping Ctrl+C."""
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        yield fd
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+class Keyboard:
+    """Single key presses without Enter, on Windows and macOS/Linux.
 
+    Use as a context manager; Ctrl+C still raises KeyboardInterrupt.
+    """
 
-def read_key(fd: int, timeout: float) -> Optional[str]:
-    readable, _, _ = select.select([fd], [], [], timeout)
-    if not readable:
-        return None
-    data = os.read(fd, 32)
-    # Ignore escape sequences (arrow keys etc.) rather than misreading them.
-    if not data or data.startswith(b"\x1b"):
-        return None
-    return data[:1].decode(errors="ignore").lower()
+    def __enter__(self) -> "Keyboard":
+        if os.name != "nt":
+            self.fd = sys.stdin.fileno()
+            self.old_attrs = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if os.name != "nt":
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
+
+    def read_key(self, timeout: float) -> Optional[str]:
+        """Next key as a lower-case character, or None on timeout/special key."""
+        if os.name == "nt":
+            deadline = time.monotonic() + timeout
+            while not msvcrt.kbhit():
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.01)
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):  # arrow/function key prefix
+                msvcrt.getwch()
+                return None
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            return ch.lower()
+
+        readable, _, _ = select.select([self.fd], [], [], timeout)
+        if not readable:
+            return None
+        data = os.read(self.fd, 32)
+        # Ignore escape sequences (arrow keys etc.) rather than misreading them.
+        if not data or data.startswith(b"\x1b"):
+            return None
+        return data[:1].decode(errors="ignore").lower()
+
+    def flush(self) -> None:
+        """Discard pending key presses (e.g. key repeat during a move)."""
+        if os.name == "nt":
+            while msvcrt.kbhit():
+                msvcrt.getwch()
+        else:
+            termios.tcflush(self.fd, termios.TCIFLUSH)
 
 
 class ArmJogger:
@@ -131,12 +162,12 @@ class ArmJogger:
         print(f"  step: {LINEAR_STEPS_MM[self.step_index]} mm / "
               f"{ANGULAR_STEPS_DEG[self.step_index]} deg")
 
-    def handle_key(self, key: str, fd: int) -> bool:
+    def handle_key(self, key: str, keyboard: Keyboard) -> bool:
         """Handle a shared jogging key; returns False if the key is not one."""
         if key in JOG_KEYS:
             self.jog(JOG_KEYS[key])
             # Drop keys queued (e.g. by key repeat) during the move.
-            termios.tcflush(fd, termios.TCIFLUSH)
+            keyboard.flush()
         elif key == "-":
             self.change_step(-1)
         elif key in "=+":
@@ -201,10 +232,10 @@ def main() -> int:
         jogger.print_step()
         print_pose()
         reporter.start()
-        with cbreak_terminal() as fd:
+        with Keyboard() as keyboard:
             while True:
-                key = read_key(fd, 0.1)
-                if key is None or jogger.handle_key(key, fd):
+                key = keyboard.read_key(0.1)
+                if key is None or jogger.handle_key(key, keyboard):
                     continue
                 if key == "p":
                     print_pose()
