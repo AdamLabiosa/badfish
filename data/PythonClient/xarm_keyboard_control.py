@@ -155,7 +155,8 @@ class ArmJogger:
 
 
 def add_arm_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--arm-ip", required=True, help="xArm controller IP")
+    parser.add_argument("--arm-ip", default="192.168.1.103",
+                        help="xArm controller IP (default: %(default)s)")
     parser.add_argument("--speed", type=float, default=50.0,
                         help="TCP jog speed in mm/s (default: %(default)s)")
     parser.add_argument("--mvacc", type=float, default=500.0,
