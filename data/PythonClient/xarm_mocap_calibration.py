@@ -8,9 +8,7 @@ rigid-body pose averaged over several mocap frames.  The resulting CSV is the
 input for solving the mocap <-> arm-base transform (plus the flange <-> marker
 offset, since the rigid-body pivot is generally not at the TCP).
 
-Moves are discrete, blocking steps.  Holding a key repeats the step; queued
-key presses are discarded after each move so the arm never runs ahead of you.
-Ctrl+C stops the arm and exits.
+Jogging works as in xarm_keyboard_control.py.  Ctrl+C stops the arm and exits.
 """
 
 from __future__ import annotations
@@ -18,52 +16,26 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import os
-import select
 import sys
 import termios
 import threading
 import time
-import tty
 from collections import deque
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Deque, Iterator, List, Optional, Tuple
-
-try:
-    from xarm.wrapper import XArmAPI
-except ImportError as exc:
-    raise SystemExit("xArm SDK is required: python -m pip install xarm-python-sdk") from exc
+from typing import Deque, List, Optional, Tuple
 
 from NatNetClient import NatNetClient
+from xarm_keyboard_control import (
+    ArmJogger, JOG_HELP, JOG_KEYS, POSE_FORMAT, add_arm_args, cbreak_terminal, read_key,
+)
 
 
 # Calibration data lives in data/calibration/<MM-DD-YYYY>/, independent of the cwd.
 CALIBRATION_DIR = Path(__file__).resolve().parent.parent / "calibration"
 
-LINEAR_STEPS_MM = [1.0, 2.0, 5.0, 10.0, 25.0, 50.0]
-ANGULAR_STEPS_DEG = [0.5, 1.0, 2.0, 5.0, 10.0, 15.0]
-
-# key -> (x, y, z, roll, pitch, yaw) unit direction in the arm base frame
-JOG_KEYS = {
-    "w": (1, 0, 0, 0, 0, 0), "s": (-1, 0, 0, 0, 0, 0),
-    "a": (0, 1, 0, 0, 0, 0), "d": (0, -1, 0, 0, 0, 0),
-    "r": (0, 0, 1, 0, 0, 0), "f": (0, 0, -1, 0, 0, 0),
-    "u": (0, 0, 0, 1, 0, 0), "o": (0, 0, 0, -1, 0, 0),
-    "i": (0, 0, 0, 0, 1, 0), "k": (0, 0, 0, 0, -1, 0),
-    "j": (0, 0, 0, 0, 0, 1), "l": (0, 0, 0, 0, 0, -1),
-}
-
-HELP = """
-  Translate (base frame)      Rotate (base frame)
-    w / s   +X / -X             u / o   +roll  / -roll
-    a / d   +Y / -Y             i / k   +pitch / -pitch
-    r / f   +Z / -Z             j / l   +yaw   / -yaw
-
-    - / =   smaller / larger step     space   record sample
-    p       print current pose        x       delete last sample
-    c       clear arm error/warning   h       show this help
-    q       save and quit             Ctrl+C  stop arm and quit
+HELP = JOG_HELP + """\
+    space   record sample             x       delete last sample
+    (q saves and quits)
 """
 
 CSV_HEADER = [
@@ -74,29 +46,6 @@ CSV_HEADER = [
     "mocap_qx", "mocap_qy", "mocap_qz", "mocap_qw",
     "mocap_pos_std_m", "mocap_frames", "mocap_mean_error_m",
 ]
-
-
-@contextmanager
-def cbreak_terminal() -> Iterator[int]:
-    """Deliver key presses immediately (no Enter) while keeping Ctrl+C."""
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        yield fd
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-def read_key(fd: int, timeout: float) -> Optional[str]:
-    readable, _, _ = select.select([fd], [], [], timeout)
-    if not readable:
-        return None
-    data = os.read(fd, 32)
-    # Ignore escape sequences (arrow keys etc.) rather than misreading them.
-    if not data or data.startswith(b"\x1b"):
-        return None
-    return data[:1].decode(errors="ignore")
 
 
 def average_quaternion(quats: List[Tuple[float, float, float, float]]) -> Tuple[float, ...]:
@@ -114,7 +63,6 @@ def average_quaternion(quats: List[Tuple[float, float, float, float]]) -> Tuple[
 class Calibrator:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.step_index = args.step_index
         self.samples: List[list] = []
         self.clock_zero = time.monotonic()
 
@@ -132,7 +80,7 @@ class Calibrator:
         self.client.set_print_level(0)
         self.client.new_frame_with_data_listener = self.on_mocap_frame
 
-        self.arm: Optional[XArmAPI] = None
+        self.jogger: Optional[ArmJogger] = None
 
     # ----------------------------------------------------------------- mocap
     def on_mocap_frame(self, data: dict) -> None:
@@ -171,63 +119,20 @@ class Calibrator:
         mean_error = sum(f[3] for f in frames) / n
         return mean_pos, quat, pos_std, n, mean_error
 
-    # ------------------------------------------------------------------- arm
-    def connect_arm(self) -> None:
-        print(f"Connecting to xArm at {self.args.arm_ip} ...")
-        self.arm = XArmAPI(self.args.arm_ip, is_radian=False)
-        if not self.arm.connected:
-            raise SystemExit(f"Could not connect to xArm at {self.args.arm_ip}")
-        self.enable_arm()
-
-    def enable_arm(self) -> None:
-        arm = self.arm
-        arm.clean_warn()
-        arm.clean_error()
-        arm.motion_enable(enable=True)
-        arm.set_mode(0)  # position control
-        arm.set_state(state=0)
-        time.sleep(0.5)
-        print(f"Arm state={arm.state} error={arm.error_code} warn={arm.warn_code}")
-
-    def arm_pose(self) -> Optional[Tuple[List[float], List[float]]]:
-        code, pose = self.arm.get_position(is_radian=False)
-        code2, joints = self.arm.get_servo_angle(is_radian=False)
-        if code != 0 or code2 != 0:
-            print(f"  ! could not read arm pose (codes {code}, {code2})")
-            return None
-        return list(pose[:6]), list(joints[:6])
-
-    def jog(self, direction: Tuple[int, ...]) -> None:
-        lin = LINEAR_STEPS_MM[self.step_index]
-        ang = ANGULAR_STEPS_DEG[self.step_index]
-        dx, dy, dz, droll, dpitch, dyaw = direction
-        code = self.arm.set_position(
-            x=dx * lin, y=dy * lin, z=dz * lin,
-            roll=droll * ang, pitch=dpitch * ang, yaw=dyaw * ang,
-            relative=True, speed=self.args.speed, mvacc=self.args.mvacc, wait=True,
-        )
-        if code != 0 or self.arm.error_code != 0:
-            print(f"  ! move failed: code={code} error={self.arm.error_code} "
-                  f"warn={self.arm.warn_code} (press c to clear)")
-        else:
-            self.print_pose()
-
     def print_pose(self) -> None:
-        result = self.arm_pose()
+        result = self.jogger.pose()
         if result is None:
             return
-        pose, _ = result
         with self.mocap_lock:
             mocap_age = time.monotonic() - self.last_mocap_time
         mocap = "ok" if mocap_age < 0.5 else "LOST"
-        print("  xyz=[{:8.1f} {:8.1f} {:8.1f}] mm  rpy=[{:7.1f} {:7.1f} {:7.1f}] deg"
-              "  mocap={}".format(*pose, mocap))
+        print("  " + POSE_FORMAT.format(*result[0]) + f"  mocap={mocap}")
 
     # --------------------------------------------------------------- samples
     def record_sample(self) -> None:
         time.sleep(self.args.settle)  # let residual vibration die out
         mocap = self.collect_mocap()
-        result = self.arm_pose()
+        result = self.jogger.pose()
         if mocap is None:
             print("  ! no valid mocap data for rigid body "
                   f"{self.args.rigid_id}; sample not recorded")
@@ -264,10 +169,6 @@ class Calibrator:
                 writer.writerow([i, *row[1:]])
         tmp.replace(self.csv_path)
 
-    def print_step(self) -> None:
-        print(f"  step: {LINEAR_STEPS_MM[self.step_index]} mm / "
-              f"{ANGULAR_STEPS_DEG[self.step_index]} deg")
-
     # ------------------------------------------------------------------ main
     def run(self) -> int:
         if not self.client.run("d"):
@@ -280,48 +181,39 @@ class Calibrator:
                   file=sys.stderr)
             return 1
 
+        args = self.args
         try:
-            self.connect_arm()
+            self.jogger = ArmJogger(args.arm_ip, args.speed, args.mvacc, args.step_index)
             print(HELP)
-            self.print_step()
+            self.jogger.print_step()
             self.print_pose()
             with cbreak_terminal() as fd:
                 while True:
                     key = read_key(fd, 0.1)
                     if key is None:
                         continue
-                    key = key.lower()
-                    if key in JOG_KEYS:
-                        self.jog(JOG_KEYS[key])
-                        # Drop keys queued (e.g. by key repeat) during the move.
-                        termios.tcflush(fd, termios.TCIFLUSH)
+                    if self.jogger.handle_key(key, fd):
+                        if key in JOG_KEYS:
+                            self.print_pose()
                     elif key == " ":
                         self.record_sample()
                         termios.tcflush(fd, termios.TCIFLUSH)
                     elif key == "x":
                         self.delete_sample()
-                    elif key == "-":
-                        self.step_index = max(0, self.step_index - 1)
-                        self.print_step()
-                    elif key in "=+":
-                        self.step_index = min(len(LINEAR_STEPS_MM) - 1, self.step_index + 1)
-                        self.print_step()
                     elif key == "p":
                         self.print_pose()
-                    elif key == "c":
-                        self.enable_arm()
                     elif key == "h":
                         print(HELP)
                     elif key == "q":
                         break
         except KeyboardInterrupt:
             print("\nInterrupted; stopping arm.")
-            if self.arm is not None:
-                self.arm.set_state(state=4)
+            if self.jogger is not None:
+                self.jogger.stop()
         finally:
             self.client.shutdown()
-            if self.arm is not None:
-                self.arm.disconnect()
+            if self.jogger is not None:
+                self.jogger.disconnect()
 
         if self.samples:
             print(f"Saved {len(self.samples)} samples to {self.csv_path}")
@@ -335,19 +227,10 @@ def parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("rigid_id", type=int,
                         help="Motive streaming ID of the end-effector rigid body")
-    parser.add_argument("--arm-ip", required=True, help="xArm controller IP")
+    add_arm_args(parser)
     parser.add_argument("--server-ip", default="192.168.31.51", help="Motive/NatNet server IP")
     parser.add_argument("--client-ip", default="192.168.31.50", help="local network-interface IP")
     parser.add_argument("--unicast", action="store_true", help="use unicast instead of multicast")
-    parser.add_argument("--speed", type=float, default=50.0,
-                        help="TCP jog speed in mm/s (default: %(default)s)")
-    parser.add_argument("--mvacc", type=float, default=500.0,
-                        help="TCP jog acceleration in mm/s^2 (default: %(default)s)")
-    parser.add_argument("--step-index", type=int, default=3,
-                        choices=range(len(LINEAR_STEPS_MM)),
-                        help="initial step size index into "
-                             f"{LINEAR_STEPS_MM} mm / {ANGULAR_STEPS_DEG} deg "
-                             "(default: %(default)s)")
     parser.add_argument("--settle", type=float, default=0.5,
                         help="seconds to wait before sampling (default: %(default)s)")
     parser.add_argument("--mocap-frames", type=int, default=60,
