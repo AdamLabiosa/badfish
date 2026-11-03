@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import select
 import signal
 import sys
 import threading
@@ -31,6 +30,18 @@ from NatNetClient import NatNetClient
 
 CameraSource = Union[int, str]
 
+BACKENDS = {
+    "auto": None,
+    "any": cv2.CAP_ANY,
+    "dshow": cv2.CAP_DSHOW,
+    "msmf": cv2.CAP_MSMF,
+    "avfoundation": cv2.CAP_AVFOUNDATION,
+    "v4l2": cv2.CAP_V4L2,
+}
+
+# How long the camera may go without delivering a frame before we give up.
+CAMERA_STALL_S = 2.0
+
 # Recordings live in data/recordings/<MM-DD-YYYY>/, independent of the cwd.
 RECORDINGS_DIR = Path(__file__).resolve().parent.parent / "recordings"
 
@@ -48,6 +59,7 @@ class Recorder:
         self.camera_error: Optional[str] = None
         self.video_frames_written = 0
         self.latest_mocap_ns = 0
+        self.camera_dropouts = 0
 
         args.output_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = args.output_dir / f"{args.name}.csv"
@@ -107,10 +119,11 @@ class Recorder:
             self.csv_file.flush()
 
     def camera_loop(self) -> None:
-        cap = cv2.VideoCapture(self.args.camera)
+        cap = open_camera(self.args.camera, self.args.backend)
         try:
             if not cap.isOpened():
-                self.camera_error = f"Could not open camera {self.args.camera!r}"
+                self.camera_error = (f"Could not open camera {self.args.camera!r} "
+                                     f"(backend {self.args.backend}); try --list-cameras")
                 self.stop_event.set()
                 return
 
@@ -121,8 +134,15 @@ class Recorder:
             if self.args.fps:
                 cap.set(cv2.CAP_PROP_FPS, self.args.fps)
 
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            # Size the writer from a real frame: some backends (notably MSMF
+            # on Windows) report 0x0 or a stale size before the first read,
+            # and VideoWriter silently drops frames whose size doesn't match.
+            first = read_first_frame(cap, timeout_s=10.0)
+            if first is None:
+                self.camera_error = f"Camera {self.args.camera!r} opened but returned no frames"
+                self.stop_event.set()
+                return
+            height, width = first.shape[:2]
             fps = self.args.fps or cap.get(cv2.CAP_PROP_FPS)
             if not math.isfinite(fps) or fps <= 1:
                 fps = 30.0
@@ -136,15 +156,27 @@ class Recorder:
                 self.stop_event.set()
                 return
 
+            print(f"Camera {self.args.camera!r}: {width}x{height} @ {fps:g} fps")
             try:
                 self.camera_ready.set()
                 last_written_frame = None
+                last_ok = time.monotonic()
                 while not self.stop_event.is_set():
                     ok, frame = cap.read()
-                    if not ok:
-                        self.camera_error = "Camera stopped returning frames"
-                        self.stop_event.set()
-                        break
+                    if not ok or frame is None:
+                        # Windows backends drop the occasional frame; only a
+                        # sustained stall ends the recording.
+                        if time.monotonic() - last_ok > CAMERA_STALL_S:
+                            self.camera_error = (
+                                f"Camera returned no frames for {CAMERA_STALL_S:g}s")
+                            self.stop_event.set()
+                            break
+                        self.camera_dropouts += 1
+                        time.sleep(0.005)
+                        continue
+                    last_ok = time.monotonic()
+                    if frame.shape[:2] != (height, width):
+                        frame = cv2.resize(frame, (width, height))
                     if not self.recording_started.is_set():
                         continue
 
@@ -186,8 +218,9 @@ class Recorder:
         camera_thread.start()
 
         # Initialize the camera before connecting, but do not record until the
-        # first valid target rigid-body sample arrives.
-        deadline = time.monotonic() + 5.0
+        # first valid target rigid-body sample arrives.  (The camera thread
+        # has its own 10 s first-frame timeout; this is a backstop.)
+        deadline = time.monotonic() + 15.0
         while not self.stop_event.is_set() and not self.camera_ready.is_set():
             if time.monotonic() >= deadline:
                 self.camera_error = "Timed out waiting for the first camera frame"
@@ -210,13 +243,26 @@ class Recorder:
 
         if not self.stop_event.is_set():
             print("Recording... press Enter or Ctrl+C to stop.")
+            if sys.stdin.isatty():
+                # select() on stdin is POSIX-only (WinError 10038 on Windows),
+                # so wait for Enter on a background thread instead.
+                threading.Thread(target=self.wait_for_enter, name="stdin",
+                                 daemon=True).start()
         try:
+            warned_stale = False
             while not self.stop_event.wait(0.1):
-                if sys.stdin.isatty():
-                    readable, _, _ = select.select([sys.stdin], [], [], 0)
-                    if readable:
-                        sys.stdin.readline()
-                        self.stop_event.set()
+                # Video is capped at the latest mocap sample, so if mocap
+                # stops arriving the video silently stalls too -- say so.
+                if self.recording_started.is_set():
+                    stale_s = (self.elapsed_ns() - self.latest_mocap_ns) / 1e9
+                    if stale_s > 1.0 and not warned_stale:
+                        print(f"WARNING: no samples for rigid body {self.args.rigid_id} "
+                              f"in {stale_s:.1f}s (lost tracking or stream dropped?)",
+                              file=sys.stderr)
+                        warned_stale = True
+                    elif stale_s <= 1.0 and warned_stale:
+                        print("Mocap samples resumed.", file=sys.stderr)
+                        warned_stale = False
         except KeyboardInterrupt:
             self.stop_event.set()
         finally:
@@ -226,11 +272,66 @@ class Recorder:
             with self.csv_lock:
                 self.csv_file.close()
 
+        if self.camera_dropouts:
+            print(f"Note: camera dropped {self.camera_dropouts} reads (frames were duplicated "
+                  "to keep timing).", file=sys.stderr)
         if self.camera_error:
             print(f"ERROR: {self.camera_error}", file=sys.stderr)
             return 1
         print(f"Saved {self.csv_path} and {self.video_path} ({self.video_frames_written} frames)")
         return 0
+
+
+    def wait_for_enter(self) -> None:
+        try:
+            if sys.stdin.readline():
+                self.stop_event.set()
+        except (OSError, ValueError):
+            pass
+
+
+def default_backend() -> str:
+    # DirectShow opens much faster and more reliably than MSMF (OpenCV's
+    # Windows default) for most USB webcams.
+    return "dshow" if sys.platform == "win32" else "auto"
+
+
+def open_camera(source: CameraSource, backend: str) -> "cv2.VideoCapture":
+    api = BACKENDS[backend]
+    if api is None or isinstance(source, str):  # URLs/files go through FFmpeg
+        return cv2.VideoCapture(source)
+    return cv2.VideoCapture(source, api)
+
+
+def read_first_frame(cap: "cv2.VideoCapture", timeout_s: float):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            return frame
+        time.sleep(0.05)
+    return None
+
+
+def list_cameras(backend: str, max_index: int = 10) -> None:
+    print(f"Probing camera indices 0-{max_index - 1} (backend {backend})...")
+    found = False
+    for index in range(max_index):
+        cap = open_camera(index, backend)
+        try:
+            if not cap.isOpened():
+                continue
+            frame = read_first_frame(cap, timeout_s=3.0)
+            if frame is None:
+                print(f"  {index}: opens but returns no frames")
+            else:
+                h, w = frame.shape[:2]
+                print(f"  {index}: {w}x{h} @ {cap.get(cv2.CAP_PROP_FPS):g} fps")
+            found = True
+        finally:
+            cap.release()
+    if not found:
+        print("  no cameras found; try a different --backend")
 
 
 def camera_source(value: str) -> CameraSource:
@@ -242,12 +343,16 @@ def camera_source(value: str) -> CameraSource:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("rigid_id", type=int, help="Motive rigid-body streaming ID")
+    parser.add_argument("rigid_id", type=int, nargs="?", help="Motive rigid-body streaming ID")
     parser.add_argument("--server-ip", default="192.168.31.51", help="Motive/NatNet server IP")
     parser.add_argument("--client-ip", default="192.168.31.50", help="local network-interface IP")
     parser.add_argument("--unicast", action="store_true", help="use unicast instead of multicast")
     parser.add_argument("--camera", type=camera_source, default=2,
                         help="camera index or stream URL (default: %(default)s)")
+    parser.add_argument("--backend", choices=sorted(BACKENDS), default=default_backend(),
+                        help="OpenCV capture backend (default: %(default)s)")
+    parser.add_argument("--list-cameras", action="store_true",
+                        help="list working camera indices and exit")
     parser.add_argument("--width", type=int, help="requested camera width")
     parser.add_argument("--height", type=int, help="requested camera height")
     parser.add_argument("--fps", type=float, help="requested/output frame rate")
@@ -255,11 +360,17 @@ def parse_args() -> argparse.Namespace:
                         default=RECORDINGS_DIR / time.strftime("%m-%d-%Y"),
                         help="output folder (default: %(default)s)")
     parser.add_argument("--name", default=time.strftime("capture_%Y%m%d_%H%M%S"))
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.rigid_id is None and not args.list_cameras:
+        parser.error("rigid_id is required (unless using --list-cameras)")
+    return args
 
 
 def main() -> int:
     args = parse_args()
+    if args.list_cameras:
+        list_cameras(args.backend)
+        return 0
     recorder = Recorder(args)
 
     def request_stop(_signum: int, _frame: object) -> None:
