@@ -29,6 +29,10 @@ from xarm_keyboard_control import (
 )
 
 
+# Same NatNet addresses as record_mocap_camera.py; find_mocap.py discovers them.
+MOCAP_SERVER_IP = "10.140.10.216"
+MOCAP_CLIENT_IP = "10.140.10.216"
+
 # Calibration data lives in data/calibration/<MM-DD-YYYY>/, independent of the cwd.
 CALIBRATION_DIR = Path(__file__).resolve().parent.parent / "calibration"
 
@@ -68,6 +72,7 @@ class Calibrator:
         self.mocap_lock = threading.Lock()
         self.mocap_frames: Deque[tuple] = deque(maxlen=1000)
         self.last_mocap_time = 0.0
+        self.seen_rigid_ids: set = set()
 
         args.output_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = args.output_dir / f"{args.name}.csv"
@@ -85,6 +90,7 @@ class Calibrator:
     def on_mocap_frame(self, data: dict) -> None:
         """NatNet callback; invoked after a complete mocap frame is decoded."""
         rigid_bodies = data["mocap_data"].rigid_body_data.rigid_body_list
+        self.seen_rigid_ids.update(rb.id_num for rb in rigid_bodies)
         body = next((rb for rb in rigid_bodies if rb.id_num == self.args.rigid_id), None)
         if body is None:
             return
@@ -128,16 +134,17 @@ class Calibrator:
         print("  " + POSE_FORMAT.format(*result[0]) + f"  mocap={mocap}")
 
     # --------------------------------------------------------------- samples
-    def record_sample(self) -> None:
+    def record_sample(self) -> bool:
+        """Average mocap at the current arm pose and append a row; True if recorded."""
         time.sleep(self.args.settle)  # let residual vibration die out
         mocap = self.collect_mocap()
         result = self.jogger.pose()
         if mocap is None:
             print("  ! no valid mocap data for rigid body "
                   f"{self.args.rigid_id}; sample not recorded")
-            return
+            return False
         if result is None:
-            return
+            return False
         pose, joints = result
         mean_pos, quat, pos_std, n, mean_error = mocap
         row = [
@@ -149,6 +156,7 @@ class Calibrator:
         warn = "  (noisy! arm may still be moving)" if pos_std > self.args.max_std else ""
         print(f"  + sample {row[0]} recorded ({n} frames, std {pos_std * 1000:.2f} mm)"
               f"{warn}")
+        return True
 
     def delete_sample(self) -> None:
         if not self.samples:
@@ -169,15 +177,39 @@ class Calibrator:
         tmp.replace(self.csv_path)
 
     # ------------------------------------------------------------------ main
-    def run(self) -> int:
+    def connect_mocap(self, require_body: bool = False) -> bool:
+        """Connect to Motive and check the rigid body is streaming.
+
+        A missing body is a warning, or an error if require_body is set.
+        """
         if not self.client.run("d"):
             print("ERROR: Could not start the NatNet client", file=sys.stderr)
-            return 1
+            return False
         time.sleep(1.0)
         if not self.client.connected():
             self.client.shutdown()
-            print("ERROR: Could not connect to Motive; check streaming and IP settings",
-                  file=sys.stderr)
+            print("ERROR: Could not connect to Motive; check streaming and IP settings "
+                  "(find_mocap.py lists the right --client-ip/--server-ip)", file=sys.stderr)
+            return False
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            with self.mocap_lock:
+                if self.mocap_frames:
+                    return True
+            time.sleep(0.05)
+        seen = sorted(self.seen_rigid_ids)
+        msg = (f"no tracked frames for rigid body {self.args.rigid_id} "
+               f"(rigid body IDs streaming: {seen or 'none'}); is it selected/tracked "
+               "in Motive and the markers visible?")
+        if require_body:
+            self.client.shutdown()
+            print(f"ERROR: {msg}", file=sys.stderr)
+            return False
+        print(f"WARNING: {msg}", file=sys.stderr)
+        return True
+
+    def run(self) -> int:
+        if not self.connect_mocap():
             return 1
 
         args = self.args
@@ -221,14 +253,14 @@ class Calibrator:
         return 0
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("rigid_id", type=int,
+def add_calibration_args(parser: argparse.ArgumentParser, rigid_optional: bool = False) -> None:
+    """Mocap and output options shared by the manual and automatic calibrators."""
+    parser.add_argument("rigid_id", type=int, nargs="?" if rigid_optional else None,
                         help="Motive streaming ID of the end-effector rigid body")
-    add_arm_args(parser)
-    parser.add_argument("--server-ip", default="127.0.0.0", help="Motive/NatNet server IP")
-    parser.add_argument("--client-ip", default="127.0.0.0", help="local network-interface IP")
+    parser.add_argument("--server-ip", default=MOCAP_SERVER_IP,
+                        help="Motive/NatNet server IP (default: %(default)s)")
+    parser.add_argument("--client-ip", default=MOCAP_CLIENT_IP,
+                        help="local network-interface IP (default: %(default)s)")
     parser.add_argument("--unicast", action="store_true", help="use unicast instead of multicast")
     parser.add_argument("--settle", type=float, default=0.5,
                         help="seconds to wait before sampling (default: %(default)s)")
@@ -243,6 +275,13 @@ def parse_args() -> argparse.Namespace:
                         default=CALIBRATION_DIR / time.strftime("%m-%d-%Y"),
                         help="output folder (default: %(default)s)")
     parser.add_argument("--name", default=time.strftime("xarm_mocap_%Y%m%d_%H%M%S"))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_calibration_args(parser)
+    add_arm_args(parser)
     return parser.parse_args()
 
 
