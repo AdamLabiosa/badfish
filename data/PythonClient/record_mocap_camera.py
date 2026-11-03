@@ -343,11 +343,11 @@ def camera_source(value: str) -> CameraSource:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("rigid_id", type=int, nargs="?", help="Motive rigid-body streaming ID")
-    parser.add_argument("--server-ip", default="192.168.31.51", help="Motive/NatNet server IP")
-    parser.add_argument("--client-ip", default="192.168.31.50", help="local network-interface IP")
+    parser.add_argument("rigid_id", type=int, help="Motive rigid-body streaming ID")
+    parser.add_argument("--server-ip", default="10.140.10.216", help="Motive/NatNet server IP")
+    parser.add_argument("--client-ip", default="10.140.10.216", help="local network-interface IP")
     parser.add_argument("--unicast", action="store_true", help="use unicast instead of multicast")
-    parser.add_argument("--camera", type=camera_source, default=2,
+    parser.add_argument("--camera", type=camera_source, default=1,
                         help="camera index or stream URL (default: %(default)s)")
     parser.add_argument("--backend", choices=sorted(BACKENDS), default=default_backend(),
                         help="OpenCV capture backend (default: %(default)s)")

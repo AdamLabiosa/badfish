@@ -227,8 +227,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("rigid_id", type=int,
                         help="Motive streaming ID of the end-effector rigid body")
     add_arm_args(parser)
-    parser.add_argument("--server-ip", default="192.168.31.51", help="Motive/NatNet server IP")
-    parser.add_argument("--client-ip", default="192.168.31.50", help="local network-interface IP")
+    parser.add_argument("--server-ip", default="127.0.0.0", help="Motive/NatNet server IP")
+    parser.add_argument("--client-ip", default="127.0.0.0", help="local network-interface IP")
     parser.add_argument("--unicast", action="store_true", help="use unicast instead of multicast")
     parser.add_argument("--settle", type=float, default=0.5,
                         help="seconds to wait before sampling (default: %(default)s)")
