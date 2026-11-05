@@ -1,3 +1,5 @@
 xarm-python-sdk
 opencv-python
 numpy
+matplotlib
+scipy

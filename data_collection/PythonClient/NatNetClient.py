@@ -270,9 +270,14 @@ class NatNetClient:
             result.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
                               socket.inet_aton(self.multicast_address) +
                               socket.inet_aton(self.local_ip_address))
+            # Windows needs the interface address here.  macOS/Linux deliver
+            # multicast only to sockets bound to the wildcard (or the group)
+            # address -- bound to a unicast IP the socket never sees a frame.
+            # The interface is still selected by IP_ADD_MEMBERSHIP above.
+            bind_ip = self.local_ip_address if sys.platform == "win32" else ""
             try:
                 # Use bind in data socket due to the nature of UDP
-                result.bind((self.local_ip_address, self.data_port))
+                result.bind((bind_ip, self.data_port))
             except socket.error as e:
                 print(f'Multicast Error: {e}')
                 sys.exit(1)
@@ -2079,9 +2084,9 @@ class NatNetClient:
 
             offset_tmp, mocap_data = self.__unpack_mocap_data(data[offset:], packet_size, major, minor) #type: ignore  # noqa E501
             offset += offset_tmp
-            print("MoCap Frame: %d\n" % (mocap_data.prefix_data.frame_number))
             # get a string version of the data for output
             if print_level >= 1:
+                print("MoCap Frame: %d\n" % (mocap_data.prefix_data.frame_number))
                 mocap_data_str = mocap_data.get_as_string()
                 print(" %s\n" % mocap_data_str)
 
@@ -2090,11 +2095,9 @@ class NatNetClient:
             trace("Packet Size: %d" % packet_size)
             offset_tmp, data_descs = self.__unpack_data_descriptions(data[offset:], packet_size, major, minor) #type: ignore  # noqa E501
             offset += offset_tmp
-            print("Data Descriptions:\n")
-            # get a string version of the data for output
-            data_descs_str = data_descs.get_as_string()
             if print_level > 0:
-                print(" %s\n" % (data_descs_str))
+                print("Data Descriptions:\n")
+                print(" %s\n" % (data_descs.get_as_string()))
 
         elif message_id == self.NAT_SERVERINFO:
             trace("Message ID : %3.1d NAT_SERVERINFO" % message_id)

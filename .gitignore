@@ -1,2 +1,8 @@
 .vscode
 __pycache__/
+.venv/
+.DS_Store
+
+# Collected data (recordings, calibration runs, rollout logs) stays local.
+data_collection/recordings/
+data_collection/calibration/

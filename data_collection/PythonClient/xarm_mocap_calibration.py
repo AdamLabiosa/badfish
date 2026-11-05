@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ipaddress
 import math
+import socket
 import sys
 import threading
 import time
@@ -29,9 +31,37 @@ from xarm_keyboard_control import (
 )
 
 
-# Same NatNet addresses as record_mocap_camera.py; find_mocap.py discovers them.
-MOCAP_SERVER_IP = "10.140.10.216"
-MOCAP_CLIENT_IP = "10.140.10.216"
+# Motive runs on its own laptop on the robot ethernet (192.168.1.x).  The local
+# (client) address is found automatically: it is this machine's address on the
+# interface that routes to the server.  find_mocap.py can double-check both.
+MOCAP_SERVER_IP = "192.168.1.1"
+DEFAULT_RIGID_ID = 7  # Motive streaming ID of the end-effector rigid body
+
+
+def local_ip_for(remote_ip: str) -> Optional[str]:
+    """This machine's IPv4 address on the interface that routes to remote_ip."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((remote_ip, 1510))  # UDP connect: picks a route, sends nothing
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
+def resolve_client_ip(server_ip: str) -> str:
+    """Pick the local address for NatNet, refusing one off the server's subnet."""
+    local = local_ip_for(server_ip)
+    if local is None:
+        raise SystemExit(f"ERROR: no network route to Motive at {server_ip}; is the "
+                         "ethernet cable plugged in?")
+    if ipaddress.ip_address(local) not in ipaddress.ip_network(f"{server_ip}/24",
+                                                               strict=False):
+        raise SystemExit(
+            f"ERROR: Motive at {server_ip} would be reached via {local}, which is not on "
+            f"its subnet (probably Wi-Fi / the default route).  Give the ethernet "
+            f"interface a static address on {server_ip.rsplit('.', 1)[0]}.x, or pass "
+            "--client-ip explicitly.")
+    return local
 
 # Calibration data lives in data/calibration/<MM-DD-YYYY>/, independent of the cwd.
 CALIBRATION_DIR = Path(__file__).resolve().parent.parent / "calibration"
@@ -76,6 +106,14 @@ class Calibrator:
 
         args.output_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = args.output_dir / f"{args.name}.csv"
+
+        if getattr(args, "no_mocap", False):
+            args.client_ip = args.client_ip or "127.0.0.1"  # NatNet client is never started
+        else:
+            if args.client_ip is None:
+                args.client_ip = resolve_client_ip(args.server_ip)
+            print(f"Mocap: Motive at {args.server_ip}, listening on {args.client_ip} "
+                  f"({'unicast' if args.unicast else 'multicast'})")
 
         self.client = NatNetClient()
         self.client.set_client_address(args.client_ip)
@@ -255,13 +293,17 @@ class Calibrator:
 
 def add_calibration_args(parser: argparse.ArgumentParser, rigid_optional: bool = False) -> None:
     """Mocap and output options shared by the manual and automatic calibrators."""
-    parser.add_argument("rigid_id", type=int, nargs="?" if rigid_optional else None,
-                        help="Motive streaming ID of the end-effector rigid body")
+    parser.add_argument("rigid_id", type=int, nargs="?", default=DEFAULT_RIGID_ID,
+                        help="Motive streaming ID of the end-effector rigid body "
+                             "(default: %(default)s)")
     parser.add_argument("--server-ip", default=MOCAP_SERVER_IP,
                         help="Motive/NatNet server IP (default: %(default)s)")
-    parser.add_argument("--client-ip", default=MOCAP_CLIENT_IP,
-                        help="local network-interface IP (default: %(default)s)")
-    parser.add_argument("--unicast", action="store_true", help="use unicast instead of multicast")
+    parser.add_argument("--client-ip", default=None,
+                        help="local network-interface IP (default: this machine's "
+                             "address on the interface that reaches --server-ip)")
+    parser.add_argument("--unicast", action="store_true",
+                        help="use unicast instead of multicast (Motive's streaming "
+                             "Transmission Type must match)")
     parser.add_argument("--settle", type=float, default=0.5,
                         help="seconds to wait before sampling (default: %(default)s)")
     parser.add_argument("--mocap-frames", type=int, default=60,

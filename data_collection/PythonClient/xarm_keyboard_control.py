@@ -23,10 +23,15 @@ else:
     import termios
     import tty
 
-try:
-    from xarm.wrapper import XArmAPI
-except ImportError as exc:
-    raise SystemExit("xArm SDK is required: python -m pip install xarm-python-sdk") from exc
+
+def _xarm_api():
+    """Import the SDK only when connecting, so offline tools (e.g. the auto
+    calibration --dry-run) work without it."""
+    try:
+        from xarm.wrapper import XArmAPI
+    except ImportError as exc:
+        raise SystemExit("xArm SDK is required: python -m pip install xarm-python-sdk") from exc
+    return XArmAPI
 
 
 LINEAR_STEPS_MM = [1.0, 2.0, 5.0, 10.0, 25.0, 50.0]
@@ -115,9 +120,16 @@ class ArmJogger:
         self.mvacc = mvacc
         self.step_index = step_index
         print(f"Connecting to xArm at {ip} ...")
-        self.arm = XArmAPI(ip, is_radian=False)
+        self.arm = _xarm_api()(ip, is_radian=False)
         if not self.arm.connected:
             raise SystemExit(f"Could not connect to xArm at {ip}")
+        # enable() clears errors; remember what the arm reported first so callers
+        # can make the user acknowledge e.g. a collision stop before moving again.
+        code, err_warn = self.arm.get_err_warn_code()
+        if code == 0 and err_warn:
+            self.startup_error = (err_warn[0], err_warn[1])
+        else:
+            self.startup_error = (self.arm.error_code, self.arm.warn_code)
         self.enable()
 
     def enable(self) -> None:
