@@ -180,6 +180,59 @@ def inverse(target: np.ndarray, seed: Sequence[float], iterations: int = 100,
     return None
 
 
+def inverse_closest(target: np.ndarray, seed: Sequence[float], tool_length: float = 0.0,
+                    margin_deg: float = 0.0, iterations: int = 300
+                    ) -> Tuple[np.ndarray, float, float]:
+    """Joint angles inside the joint limits (shrunk by `margin_deg`) that come as
+    close as possible to the flange pose `target`, searched near `seed` (deg).
+
+    Where the target is out of the limits, the tool tip (`tool_length` mm along
+    the flange z axis) is kept on target first and the orientation gives way.
+    Returns (joints, tool-tip position error in mm, orientation error in deg);
+    both errors are ~0 when the pose is reachable.
+    """
+    lo = XARM6_JOINT_LIMITS[:, 0] + margin_deg
+    hi = XARM6_JOINT_LIMITS[:, 1] - margin_deg
+    tool = np.eye(4)
+    tool[2, 3] = tool_length
+    goal = target @ tool
+    w = 50.0  # mm per rad: well below the plain solver's, so position wins
+    q = np.clip(np.array(seed, dtype=float), lo, hi)
+
+    def error(q: np.ndarray) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
+        frames = forward_frames(q)
+        cur = frames[-1] @ tool
+        return (goal[:3, 3] - cur[:3, 3],
+                matrix_to_rotvec(goal[:3, :3] @ cur[:3, :3].T), frames)
+
+    for _ in range(iterations):
+        dp, dr, frames = error(q)
+        if np.linalg.norm(dp) < 0.01 and math.degrees(np.linalg.norm(dr)) < 0.005:
+            break
+        p = frames[-1][:3, 3] + tool_length * frames[-1][:3, 2]
+        jac = np.zeros((6, 6))
+        for i in range(6):
+            z, o = frames[i + 1][:3, 2], frames[i + 1][:3, 3]
+            jac[:3, i] = np.cross(z, p - o)
+            jac[3:, i] = w * z
+        err = np.concatenate([dp, w * dr])
+        # Joints sitting on a limit and pushed further into it are held fixed.
+        free = np.ones(6, bool)
+        for _ in range(6):
+            j = jac * free
+            dq = np.degrees(j.T @ np.linalg.solve(j @ j.T + np.eye(6), err))
+            stuck = free & (((q <= lo + 1e-9) & (dq < 0)) | ((q >= hi - 1e-9) & (dq > 0)))
+            if not stuck.any():
+                break
+            free &= ~stuck
+        q_new = np.clip(q + dq, lo, hi)
+        if np.max(np.abs(q_new - q)) < 1e-5:
+            break
+        q = q_new
+    dp, dr, _ = error(q)
+    return q, float(np.linalg.norm(dp)), math.degrees(float(np.linalg.norm(dr)))
+
+
 def within_limits(joints: Sequence[float], margin_deg: float = 0.0) -> bool:
     q = np.asarray(joints)
     return bool(np.all(q >= XARM6_JOINT_LIMITS[:, 0] + margin_deg)

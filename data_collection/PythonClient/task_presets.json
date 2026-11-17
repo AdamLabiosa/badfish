@@ -1,0 +1,11 @@
+{
+  "gut_fish": {
+    "task": "gut the fish",
+    "steps": [
+      "cut open the belly",
+      "switch the tool to scooper",
+      "remove the guts",
+      "switch the tool to knife"
+    ]
+  }
+}

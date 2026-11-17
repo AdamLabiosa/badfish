@@ -6,3 +6,6 @@ __pycache__/
 # Collected data (recordings, calibration runs, rollout logs) stays local.
 data_collection/recordings/
 data_collection/calibration/
+
+# Converted training datasets (rebuild with preprocessing/convert_to_lerobot.py).
+preprocessing/datasets/

@@ -16,6 +16,9 @@ Planning (offline, identical for --dry-run and a real run):
      the same safety model as the auto calibration: joint limits, table and
      tool-to-arm clearance, arm folding onto its base, J4/J6 cable wrap and
      wrist singularity.  Any failure aborts with the time it happens at.
+     Where a pose is beyond the joint limits, the closest pose inside them is
+     used instead (tool tip kept on target first, orientation gives way), as
+     long as it misses by no more than --max-deviation.
   4. Time-scale: --speed-scale (default 0.5 = half the demo speed), slowed
      further if needed so joint speed/acceleration and flange/tool-tip speed
      stay under --max-joint-speed / --max-joint-acc / --max-speed.
@@ -170,6 +173,9 @@ class Plan:
     min_self: float
     extent: np.ndarray             # (3,2) flange xyz range, mm
     boundary_speed: Tuple[float, float]  # max joint speed at the first/last sample, deg/s
+    max_dev: np.ndarray            # worst [tool-tip mm, deg] miss where out of reach
+    adjusted_time: float           # s of demo replayed at the closest reachable pose
+    adjusted_spans: List[Tuple[float, float]]  # demo times of those stretches
 
     @property
     def duration(self) -> float:
@@ -219,11 +225,31 @@ def singular(q: np.ndarray, margin_deg: float) -> bool:
 
 
 def solve_ik(targets: np.ndarray, times: np.ndarray, safety: Safety,
-             singular_margin: float) -> np.ndarray:
+             singular_margin: float, max_dev: Tuple[float, float]
+             ) -> Tuple[np.ndarray, np.ndarray]:
+    """Joints for every target, plus the (N,2) [tool-tip mm, deg] by which each
+    sample misses its target (0 where reachable).  Targets beyond the joint limits
+    get the closest pose inside them, up to `max_dev`."""
     def fail(i: int, why: str) -> PlanError:
         x, y, z, roll, pitch, yaw = kin.matrix_to_pose(targets[i])
         return PlanError(f"t={times[i]:.2f} s: {why} (flange xyz=[{x:.0f} {y:.0f} {z:.0f}] "
                          f"mm rpy=[{roll:.0f} {pitch:.0f} {yaw:.0f}])")
+
+    margin = safety.joint_margin + 0.01  # strictly inside what check_joints accepts
+
+    def solve(target: np.ndarray, seed: np.ndarray, iterations: int
+              ) -> Tuple[np.ndarray, float, float]:
+        q = kin.inverse(target, seed, iterations=iterations)
+        if q is not None and kin.within_limits(q, margin):
+            return q, 0.0, 0.0
+        return kin.inverse_closest(target, seed, safety.tool_length, margin)
+
+    def too_far(i: int, mm: float, deg: float) -> Optional[PlanError]:
+        if mm <= max_dev[0] and deg <= max_dev[1]:
+            return None
+        return fail(i, f"out of reach: the closest pose within the joint limits is "
+                       f"{mm:.1f} mm / {deg:.1f} deg off (--max-deviation {max_dev[0]:g} "
+                       f"{max_dev[1]:g})")
 
     ready = np.array(DEFAULT_READY_JOINTS, float)
     first = targets[0]
@@ -231,26 +257,29 @@ def solve_ik(targets: np.ndarray, times: np.ndarray, safety: Safety,
     toward[0] = math.degrees(math.atan2(first[1, 3], first[0, 3]))
     best, best_reason = None, "unreachable"
     for seed in (ready, toward):
-        q = kin.inverse(first, seed, iterations=400)
-        if q is None:
-            continue
+        q, mm, deg = solve(first, seed, 400)
+        err = too_far(0, mm, deg)
+        if err:
+            raise err
         reason = check_joints(q, safety) or (
             "near wrist singularity" if singular(q, singular_margin) else None)
         if reason:
             best_reason = reason
             continue
-        if best is None or np.max(np.abs(q - ready)) < np.max(np.abs(best - ready)):
-            best = q
+        # Prefer the smaller miss, then the configuration closest to ready.
+        key = (round(mm + 10 * deg, 1), float(np.max(np.abs(q - ready))))
+        if best is None or key < best[0]:
+            best = (key, q, (mm, deg))
     if best is None:
         raise fail(0, f"start pose {best_reason}")
+    _, best, best_dev = best
 
-    joints = [best]
+    joints, devs = [best], [best_dev]
     for i in range(1, len(targets)):
-        q = kin.inverse(targets[i], joints[-1], iterations=100)
-        if q is None:
-            q = kin.inverse(targets[i], joints[-1], iterations=500)
-        if q is None:
-            raise fail(i, "unreachable (IK failed)")
+        q, mm, deg = solve(targets[i], joints[-1], 100)
+        err = too_far(i, mm, deg)
+        if err:
+            raise err
         jump = float(np.max(np.abs(q - joints[-1])))
         if jump > MAX_IK_STEP_DEG:
             raise fail(i, f"IK jumped {jump:.0f} deg in one step (singularity or "
@@ -261,7 +290,17 @@ def solve_ik(targets: np.ndarray, times: np.ndarray, safety: Safety,
         if reason:
             raise fail(i, reason)
         joints.append(q)
-    return np.array(joints)
+        devs.append((mm, deg))
+    return np.array(joints), np.array(devs)
+
+
+def spans(t: np.ndarray, mask: np.ndarray) -> List[Tuple[float, float]]:
+    """Contiguous [start, end] times where mask is set."""
+    out: List[Tuple[float, float]] = []
+    edges = np.diff(np.concatenate([[0], mask.astype(int), [0]]))
+    for a, b in zip(np.nonzero(edges == 1)[0], np.nonzero(edges == -1)[0]):
+        out.append((float(t[a]), float(t[b - 1])))
+    return out
 
 
 def tool_points(joints: np.ndarray, tool_length: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -294,7 +333,9 @@ def build_plan(demo: Demo, calibration: MocapCalibration, args: argparse.Namespa
     tg, pos, quat = resample(demo, t0, t1, args.rate, args.smooth)
     targets = calibration.flange_poses(pos, quat)
     targets[:, :3, 3] += np.asarray(args.offset)
-    joints = solve_ik(targets, tg, safety, args.singular_margin)
+    joints, devs = solve_ik(targets, tg, safety, args.singular_margin,
+                            tuple(args.max_deviation))
+    adjusted = (devs[:, 0] > 1.0) | (devs[:, 1] > 1.0)
 
     src_t, exec_joints, warp = time_warp(tg, joints, safety.tool_length, args)
     flange = tool_points(joints, safety.tool_length)[0]
@@ -306,7 +347,9 @@ def build_plan(demo: Demo, calibration: MocapCalibration, args: argparse.Namespa
 
     return Plan(rate=args.rate, src_t=src_t, joints=exec_joints, window=(t0, t1),
                 min_table=min_table, min_self=min_self,
-                extent=np.column_stack([flange.min(0), flange.max(0)]), **warp)
+                extent=np.column_stack([flange.min(0), flange.max(0)]),
+                max_dev=devs.max(0), adjusted_time=float(adjusted.sum()) * dt,
+                adjusted_spans=spans(tg, adjusted), **warp)
 
 
 def time_warp(tg: np.ndarray, joints: np.ndarray, tool_length: float,
@@ -392,6 +435,12 @@ def print_plan(demo: Demo, plan: Plan, safety: Safety) -> None:
         f"{v:.0f}" for v in plan.peak_joint_speed) + f"], peak joint accel "
         f"{plan.peak_joint_acc:.0f} deg/s^2")
     print(f"Peak flange/tool-tip speed {plan.peak_lin_speed:.0f} mm/s")
+    if plan.adjusted_time > 0:
+        where = ", ".join(f"{a:.1f}-{b:.1f}" for a, b in plan.adjusted_spans[:6])
+        more = f" (+{len(plan.adjusted_spans) - 6} more)" if len(plan.adjusted_spans) > 6 else ""
+        print(f"Beyond the joint limits for {plan.adjusted_time:.1f} s of the demo (t = {where}"
+              f"{more} s): replays the closest reachable pose there, tool tip off by up to "
+              f"{plan.max_dev[0]:.0f} mm / {plan.max_dev[1]:.0f} deg")
     self_text = (f"{plan.min_self:.0f} mm" if math.isfinite(plan.min_self) else "n/a")
     table_req = ("check off" if not math.isfinite(safety.table_margin)
                  else f"required {safety.table_margin:.0f}")
@@ -815,6 +864,11 @@ def parse_args() -> argparse.Namespace:
                            "(default: %(default)s)")
     tool.add_argument("--min-z", type=float, default=None,
                       help="z floor for the flange centre and tool tip, mm (default: none)")
+    tool.add_argument("--max-deviation", type=float, nargs=2, default=(25.0, 15.0),
+                      metavar=("MM", "DEG"),
+                      help="where the demo goes beyond the joint limits, replay the closest "
+                           "reachable pose if the tool tip misses by at most this much; "
+                           "otherwise refuse (default: %(default)s).  0 0 = exact only")
     tool.add_argument("--singular-margin", type=float, default=10.0,
                       help="min |J5| away from 0/180 deg (wrist singularity) "
                            "(default: %(default)s)")

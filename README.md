@@ -124,6 +124,7 @@ python plot_mocap_trajectory.py            # newest run; --no-show only writes t
 ```bash
 python record_mocap_camera.py --list-cameras      # find the camera index (saves a snapshot of each)
 python record_mocap_camera.py --name pick_cup_01
+python record_mocap_camera.py --name gut_01 --preset gut_fish   # fish gutting, with step labels
 ```
 
 1. A status line shows whether the rigid body is tracked and where the flange would be in the arm
@@ -131,11 +132,15 @@ python record_mocap_camera.py --name pick_cup_01
    `UNSAFE: <reason>`).
 2. Press **Enter**; after a short countdown, recording starts.
 3. **Hold the end effector still for 1–2 s**, do the motion, hold still again.
+   Press **SPACE** each time the next step of the task starts (step 1 starts with the recording;
+   **u** undoes the last mark). The status line shows the current step.
 4. Press **Enter** (or Ctrl+C) to stop and save.
 
 Outputs in `recordings/<date>/`: `<name>.csv` (every mocap frame, raw and in the arm frame),
-`<name>.mp4` (video synchronized to the CSV) and `<name>_meta.json` (settings and which calibration
-was used).
+`<name>.mp4` (video synchronized to the CSV) and `<name>_meta.json` (settings, which calibration
+was used, `task`, and `steps`). `steps` is a list of `{"name", "start_s"}`, timed on the CSV's
+`capture_time_s` clock. If the number of marks doesn't match `--steps`, the recorder warns; fix the
+times in `_meta.json` by hand.
 
 | Flag | What it does |
 |---|---|
@@ -147,6 +152,9 @@ was used).
 | `--calibration PATH` | Calibration `_solution.json` to use (default: newest). |
 | `--no-calibration` | Record raw mocap only (no arm-frame columns or reach check). |
 | `--tool-length MM` | Tool length for the reach check (default: from the calibration run). |
+| `--preset NAME` | Task and step names from `task_presets.json`, so labels are spelled the same in every demo. `gut_fish` = "gut the fish", steps: cut open the belly → switch the tool to scooper → remove the guts → switch the tool to knife. Add new tasks there. |
+| `--task TEXT` | Task instruction saved in `_meta.json`, used as the label by `preprocessing/convert_to_lerobot.py`. Overrides the preset's. |
+| `--steps NAME …` | Names of the task's steps, in order. Mark when each starts with SPACE while recording. SPACE works without `--steps` too; steps are then named `step 1`, `step 2`, … |
 
 To view a recording with its 3D path: `python visualize_run.py <name>`.
 
@@ -175,6 +183,9 @@ How it works:
 - The trajectory is smoothed, solved with inverse kinematics, and checked at every sample: joint
   limits, tool-to-arm clearance, folding onto the base, wrist cable wrap, singularities.
 - It is then time-scaled to respect the speed limits and streamed to the arm at 100 Hz in servo mode.
+- Where the demo goes a little past a joint limit (typically the wrist, J5), it uses the closest
+  pose inside the limits: the tool tip stays on target and the tool tilts slightly instead. The
+  dry-run says when and by how much; if the miss exceeds `--max-deviation`, it refuses instead.
 
 If anything fails, the dry-run says when in the demo it happens and why. The plan is written to
 `<name>_plan.csv`, and the replay log to `<name>_rollout_<time>.csv`; with `--mocap`, the tracked
@@ -198,6 +209,7 @@ limit, it slows down only that part of the trajectory. The dry-run prints both, 
 | `--no-auto-trim` | Keep the still time at the start/end (by default it is trimmed, leaving `--still-pad` s, default 0.5). |
 | `--offset DX DY DZ` | Shift the whole trajectory in the arm base frame, mm. |
 | `--smooth S` | Smoothing of mocap jitter (Gaussian sigma, default 0.04 s; 0 = off). |
+| `--max-deviation MM DEG` | How far the tool tip may miss where the demo is beyond the joint limits (default `25 15`). `0 0` = exact only. |
 | `--max-gap S` | Longest tracking dropout to interpolate over (default 0.1 s). |
 | `--max-wrist-rotation DEG` | Max J4/J6 turn from 0 (default 120). Raise it (e.g. `210`) for demos that roll or tilt the end effector a lot, **if the wrist cables have the slack**. |
 | `--table-margin MM` | Turn on the table-clearance check (off by default: the demo itself showed the end effector fits). |

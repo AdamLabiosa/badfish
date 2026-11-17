@@ -15,17 +15,23 @@ Flow:
   2. Press Enter, then a short countdown (--countdown) gives you time to pick
      the end effector up.  HOLD IT STILL for a moment at the start and end:
      the rollout starts and ends from rest, and trims still time automatically.
-  3. Press Enter (or Ctrl+C) to stop.
+  3. While recording, press SPACE each time the next step of the task starts
+     (u undoes the last mark).  Step 1 starts with the recording.
+  4. Press Enter (or Ctrl+C) to stop.
 
 Outputs in recordings/<MM-DD-YYYY>/:
   <name>.csv        every mocap frame of the rigid body (raw Motive pose) plus
                     the calibrated flange pose in the arm base frame
   <name>.mp4        camera video, constant FPS, same start/end as the CSV
-  <name>_meta.json  settings, calibration file used, frame counts
+  <name>_meta.json  settings, calibration file used, frame counts, the task and
+                    the step start times ("steps": [{"name", "start_s"}, ...],
+                    on the same clock as the CSV's capture_time_s)
 
     python record_mocap_camera.py --list-cameras
     python record_mocap_camera.py                    # rigid body 7, camera 0
     python record_mocap_camera.py 7 --camera 0 --name pick_cup_01
+    python record_mocap_camera.py --name gut_01 --preset gut_fish   # task + steps
+                                                # from task_presets.json
 """
 
 from __future__ import annotations
@@ -41,7 +47,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Deque, Optional, Tuple, Union
+from typing import Deque, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -53,6 +59,7 @@ except ImportError as exc:
 import xarm6_kinematics as kin
 from mocap_to_arm import RECORDINGS_DIR, MocapCalibration, load_calibration
 from NatNetClient import NatNetClient
+from xarm_keyboard_control import Keyboard
 from xarm_mocap_auto_calibration import DEFAULT_READY_JOINTS, Safety, check_joints
 from xarm_mocap_calibration import DEFAULT_RIGID_ID, MOCAP_SERVER_IP, resolve_client_ip
 
@@ -67,6 +74,8 @@ BACKENDS = {
     "avfoundation": cv2.CAP_AVFOUNDATION,
     "v4l2": cv2.CAP_V4L2,
 }
+
+TASK_PRESETS = Path(__file__).resolve().parent / "task_presets.json"
 
 # How long the camera may go without delivering a frame before we give up.
 CAMERA_STALL_S = 2.0
@@ -87,20 +96,29 @@ class ReachChecker:
     """Cheap live check: could the arm put its flange at this pose?"""
 
     def __init__(self, tool_length: float) -> None:
+        # No table check, as in rollout_trajectory.py: you're holding the tool, so
+        # it's above the table by construction.
         self.safety = Safety(tool_length=tool_length, tool_radius=25.0, table_z=0.0,
-                             table_margin=30.0, link_radius=60.0, self_margin=30.0)
+                             table_margin=-math.inf, link_radius=60.0, self_margin=30.0)
         self.seed = np.array(DEFAULT_READY_JOINTS, float)
 
     def check(self, flange: np.ndarray) -> str:
         q = kin.inverse(flange, self.seed, iterations=60)
         if q is None:
             q = kin.inverse(flange, DEFAULT_READY_JOINTS, iterations=200)
-        if q is None:
-            self.seed = np.array(DEFAULT_READY_JOINTS, float)
-            return "OUT OF REACH"
+        off = ""
+        margin = self.safety.joint_margin + 0.01
+        if q is None or not kin.within_limits(q, margin):
+            # Same fallback as rollout_trajectory.py: closest pose within the joint limits.
+            q, mm, deg = kin.inverse_closest(flange, self.seed, self.safety.tool_length, margin)
+            if mm > 25.0 or deg > 15.0:  # rollout_trajectory.py --max-deviation default
+                self.seed = np.array(DEFAULT_READY_JOINTS, float)
+                return f"OUT OF REACH ({mm:.0f} mm / {deg:.0f} deg)"
+            if mm > 1.0 or deg > 1.0:
+                off = f" (at joint limit, {mm:.0f} mm / {deg:.0f} deg off)"
         self.seed = q
         reason = check_joints(q, self.safety)
-        return "reachable" if reason is None else f"UNSAFE: {reason}"
+        return "reachable" + off if reason is None else f"UNSAFE: {reason}"
 
 
 class Recorder:
@@ -126,6 +144,12 @@ class Recorder:
         self.rows_written = 0
         self.rows_invalid = 0
         self.show_status = False
+
+        # Task steps: step 1 starts at t=0; step_marks holds when steps 2, 3, ... start
+        # (s, recording clock), from SPACE presses.
+        self.step_names: List[str] = list(args.steps or [])
+        self.step_marks: List[float] = []
+        self.step_lock = threading.Lock()
 
         # Latest pose for the status line (written by the NatNet thread).
         self.latest_lock = threading.Lock()
@@ -234,6 +258,11 @@ class Recorder:
             prefix = ""
             if self.recording_started.is_set():
                 prefix = f"REC {self.elapsed_ns() / 1e9:6.1f}s | "
+                if self.step_names or self.step_marks:
+                    with self.step_lock:
+                        n = len(self.step_marks) + 1
+                    total = len(self.step_names) or "?"
+                    prefix += f"step {n}/{total} {self.step_name(n)} | "
             line = prefix + self.status_line()
             # Pad to wipe the previous (possibly longer) line.
             sys.stdout.write("\r" + line.ljust(width))
@@ -391,10 +420,19 @@ class Recorder:
                     self.armed.set()
                     print("RECORDING -- hold still for a moment, do the motion, hold "
                           "still, then press Enter (or Ctrl+C) to stop.")
-                    self.show_status = True
-                    threading.Thread(target=self.wait_for_enter, name="stdin",
-                                     daemon=True).start()
-                    self.monitor()
+                    if sys.stdin.isatty():
+                        print("Press SPACE when each new step starts (u undoes the last "
+                              "mark).")
+                        self.show_status = True
+                        with Keyboard() as keyboard:
+                            threading.Thread(target=self.key_loop, args=(keyboard,),
+                                             name="keys", daemon=True).start()
+                            self.monitor()
+                    else:  # piped stdin: no single-key input, Enter only
+                        self.show_status = True
+                        threading.Thread(target=self.wait_for_enter, name="stdin",
+                                         daemon=True).start()
+                        self.monitor()
         except (KeyboardInterrupt, EOFError):
             pass
         finally:
@@ -421,6 +459,13 @@ class Recorder:
         self.write_meta()
         duration = self.latest_mocap_ns / 1e9
         print(f"Saved {self.csv_path}\n      {self.video_path}\n      {self.meta_path}")
+        steps = self.steps()
+        if steps:
+            print("Steps: " + ", ".join(f"{s['name']} @ {s['start_s']:.1f}s" for s in steps))
+            if self.step_names and len(steps) != len(self.step_names):
+                print(f"WARNING: {len(steps)} steps marked but --steps lists "
+                      f"{len(self.step_names)}; fix \"steps\" in {self.meta_path.name}",
+                      file=sys.stderr)
         print(f"{duration:.1f} s, {self.rows_written} mocap frames "
               f"({self.rows_written / max(duration, 1e-9):.0f} Hz, {self.rows_invalid} "
               f"untracked), {self.video_frames_written} video frames")
@@ -452,6 +497,59 @@ class Recorder:
         except (OSError, ValueError):
             pass
 
+    def key_loop(self, keyboard: Keyboard) -> None:
+        """While recording: Enter stops, SPACE marks the next step, u undoes a mark."""
+        while not self.stop_event.is_set():
+            try:
+                key = keyboard.read_key(0.1)
+            except KeyboardInterrupt:  # Windows delivers Ctrl+C here
+                self.stop_event.set()
+                return
+            except (OSError, ValueError):
+                return
+            if key in ("\n", "\r"):
+                self.stop_event.set()
+            elif key == " ":
+                self.mark_step()
+            elif key == "u":
+                self.undo_step()
+
+    # ----------------------------------------------------------------- steps
+    def step_name(self, number: int) -> str:
+        """Name of step `number` (1-based)."""
+        if number <= len(self.step_names):
+            return self.step_names[number - 1]
+        return f"step {number}"
+
+    def mark_step(self) -> None:
+        if not self.recording_started.is_set():
+            return
+        t = self.elapsed_ns() / 1e9
+        with self.step_lock:
+            self.step_marks.append(t)
+            number = len(self.step_marks) + 1
+        extra = " (more steps than --steps lists)" if self.step_names and \
+            number > len(self.step_names) else ""
+        print(f"\nStep {number} \"{self.step_name(number)}\" starts at {t:.1f} s{extra}")
+
+    def undo_step(self) -> None:
+        with self.step_lock:
+            if not self.step_marks:
+                return
+            t = self.step_marks.pop()
+            number = len(self.step_marks) + 2
+        print(f"\nUndid the start of step {number} \"{self.step_name(number)}\" "
+              f"(was at {t:.1f} s)")
+
+    def steps(self) -> List[dict]:
+        """[{"name", "start_s"}] for the recorded steps; empty if steps weren't used."""
+        with self.step_lock:
+            marks = list(self.step_marks)
+        if not self.step_names and not marks:
+            return []
+        return [{"name": self.step_name(i + 1), "start_s": round(t, 3)}
+                for i, t in enumerate([0.0] + marks)]
+
     def write_meta(self) -> None:
         args = self.args
         meta = {
@@ -471,6 +569,11 @@ class Recorder:
             "tool_length": args.tool_length,
             "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        if args.task:
+            meta["task"] = args.task
+        steps = self.steps()
+        if steps:
+            meta["steps"] = steps
         self.meta_path.write_text(json.dumps(meta, indent=2))
 
 
@@ -580,7 +683,22 @@ def parse_args() -> argparse.Namespace:
                         default=RECORDINGS_DIR / time.strftime("%m-%d-%Y"),
                         help="output folder (default: %(default)s)")
     parser.add_argument("--name", default=time.strftime("demo_%Y%m%d_%H%M%S"))
-    return parser.parse_args()
+    parser.add_argument("--preset", help=f"task + steps from {TASK_PRESETS.name} (e.g. gut_fish); "
+                                         "--task/--steps override")
+    parser.add_argument("--task", help='task instruction saved in _meta.json, e.g. "gut the fish"')
+    parser.add_argument("--steps", nargs="+", metavar="NAME",
+                        help="names of the task's steps, in order; press SPACE while "
+                             "recording when each next step starts")
+    args = parser.parse_args()
+    if args.preset:
+        presets = json.loads(TASK_PRESETS.read_text())
+        if args.preset not in presets:
+            parser.error(f"unknown --preset {args.preset!r}; {TASK_PRESETS.name} has: "
+                         + ", ".join(sorted(presets)))
+        preset = presets[args.preset]
+        args.task = args.task or preset.get("task")
+        args.steps = args.steps or preset.get("steps")
+    return args
 
 
 def main() -> int:

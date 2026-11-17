@@ -1,0 +1,6 @@
+# Preprocessing venv (Python >= 3.12, separate from the data_collection venv):
+#   uv venv --python 3.12 preprocessing/.venv
+#   uv pip install --python preprocessing/.venv/bin/python -r preprocessing/requirements.txt
+# Pin lerobot to the version the training side (CHTC) uses: the dataset format must match.
+lerobot[dataset]==0.7.0
+scipy
